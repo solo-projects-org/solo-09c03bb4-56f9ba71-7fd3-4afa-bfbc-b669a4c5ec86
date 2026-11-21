@@ -1,0 +1,11 @@
+# 本地引导安装的依赖（容器内无 pip/venv 时的临时位置，Docker 构建不使用）
+.pylibs/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# SQLite 数据文件
+*.db
+/data/
