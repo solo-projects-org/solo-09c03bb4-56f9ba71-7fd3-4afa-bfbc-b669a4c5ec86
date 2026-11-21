@@ -1,8 +1,11 @@
-# 拆并股收盘价折算（FastAPI + SQLite）
+# 拆并股收盘价折算（FastAPI + SQLite，含交易日更正）
 
 研究员复盘拆并股前后走势时，统一收盘价的股份口径。单股日收盘价（分）与拆并股公告
 一次导入 SQLite；选区间和基准交易日，系统按基准日口径折算每日收盘价，四舍五入到分；
 可锁定预览取得送审号，公告更正或进程重启后凭送审号仍能重现原序列。
+
+供应商把收盘价标到错误交易日时，可在网页提交**交易日更正单**：只改日期归属、收盘价
+照旧；查询与复权一律按更正后的交易日取价，旧送审号仍按送审时的行情序列重现。
 
 ## 折算口径
 
@@ -18,7 +21,31 @@
 多个公告按生效日连乘；全程 `Fraction` 精确计算，结果按“四舍五入”（小数部分 ≥ 0.5 进位）
 取整到分，不使用浮点。
 
-## 业务规则
+## 交易日更正规则
+
+- **入口**：网页第 2 节，填更正单号 + 粘贴“原交易日,正确交易日”对应表（每行一条，
+  也支持 JSON）；先“校验预览”（只读不写），再“提交更正单”。
+- **只改归属**：`prices` 行带稳定主键 `price_id`，更正只 `UPDATE trade_date`，
+  收盘价不动、行不复制不删除，**原始价格记录物理上只存一份**。
+- **单内约束**：原日期须有行情；每个原日期、每个目标日期各只能出现一次；
+  `from != to`。目标日期已有行情时，那条行情也必须在同一单中作为原日期移走
+  （整体构成闭合链/置换，**允许两日互换**）。
+- **整单生效**：两阶段换键（临时前缀日期 → 目标日期）在单个事务内完成，
+  任一冲突或写入失败全量回滚，保留原归属。结构错误 422，状态冲突 409。
+- **单号收发**：成功单原样重传（对应表哈希一致）返回原结果，记 `reused`，
+  不重复移动、不新增事件；同号异文 409 报冲突，失败单不留痕。
+- **空出可补录**：迁出后空出的日期可重新导入补录；补录与更正交错时，以先提交
+  成功的结果判断冲突（后到的异价导入/占用更正按既有 409 规则退回）。
+- **刷新才能送审**：每次更正/补录生成一个新价格序列序号 `price_seq`；预览/锁定
+  带旧序号时返回 `stale=true` 并在锁定时 409，须刷新预览后再送审。
+- **历史可重现（事件溯源）**：所有导入与更正只追加登记到 `price_events` 事件流，
+  重放 `seq ≤ 送审序号` 的事件即可还原任一历史时刻的日期归属，再到 `prices`
+  单行取价（不复制价格）。
+  - 启用本功能**之前**发出的送审号：迁移时把启用时刻底表固化为基线事件（seq=1），
+    旧送审 `price_seq` 回填为 1，重开结果以**启用时查到的序列**为准；
+  - 启用**之后**发出的送审号：按送审时记录的序列重开，进程重启后结果不变。
+
+## 业务规则（公告与行情底表）
 
 - **行情底表** `prices`：按交易日唯一；同日期同价重复导入跳过，异价整批退回（409），
   底表只增不改不删，更正与送审共用，不复制行情。
@@ -28,27 +55,31 @@
   - 同号同版异文 → 409 退回（`rejected_diff`）；
   - 更高修订 → `updated` 更正现行版本；
   - 低于现行修订 → 422 退回（`rejected_old`）。
-- **预览** `GET /api/adjustments/preview`：返回折算序列、参与折算的公告依据与依据指纹
-  `basis_hash`；带旧指纹调用时返回 `stale=true`，提示须刷新。
-- **锁定送审** `POST /api/submissions`：指纹与现行公告不一致时 409 拒绝；成功后生成
-  `SB-xxxx` 送审号，并在 `submission_basis` 只留重算所需的公告快照（生效日不晚于区间起、
-  或晚于区间止/基准日的公告对相对因子恒为 1，不留底）。
-- **凭号重开** `GET /api/submissions/{id}`：快照依据 + 同一行情底表重算，公告更正或重启后
-  序列与锁定时逐点一致；同时回现行指纹与 `stale` 标记供比对。
+- **预览** `GET /api/adjustments/preview`：返回折算序列、参与折算的公告依据、依据指纹
+  `basis_hash` 与现行 `price_seq`；带旧指纹/旧序号调用时返回 `stale=true`，提示须刷新。
+- **锁定送审** `POST /api/submissions`：指纹或价格序列与现行不一致时 409 拒绝；
+  成功后生成 `SB-xxxx` 送审号，`submission_basis` 只留重算所需的公告快照，
+  `submissions.price_seq` 记录送审时的行情序列。
+- **凭号重开** `GET /api/submissions/{id}`：快照依据 + 按送审序号重放的行情归属重算，
+  公告更正、交易日更正/补录或重启后序列与锁定时逐点一致；同时回现行指纹/序列与
+  `stale` 标记供比对。
 
 ## API 一览
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/api/prices/import` | 批量导入日收盘价（分） |
-| GET | `/api/prices` | 查询底表（可选 start_date/end_date） |
+| POST | `/api/prices/import` | 批量导入/补录日收盘价（分），返回现行 price_seq |
+| GET | `/api/prices` | 查询底表（可选 start_date/end_date），按更正后归属 |
+| POST | `/api/corrections/preview` | 更正单只读校验与移动效果预览（不写库） |
+| POST | `/api/corrections/apply` | 提交交易日更正单（整单生效/原样重传/异文冲突） |
+| GET | `/api/corrections` | 已生效更正单列表 |
 | POST | `/api/announcements/import` | 导入/重送/更正公告 |
 | GET | `/api/announcements` | 现行公告（每号最高修订） |
-| GET | `/api/adjustments/preview` | 区间折算预览（参数 start_date, end_date, base_date, 可选 basis_hash） |
-| POST | `/api/submissions` | 锁定预览，取得送审号 |
-| GET | `/api/submissions/{id}` | 凭送审号重开，重现原序列 |
+| GET | `/api/adjustments/preview` | 区间折算预览（参数 start_date, end_date, base_date, 可选 basis_hash, price_seq） |
+| POST | `/api/submissions` | 锁定预览，取得送审号（须带刷新后的 basis_hash/price_seq） |
+| GET | `/api/submissions/{id}` | 凭送审号重开，按送审时序列重现原序列 |
 | GET | `/api/health` | 健康检查 |
-| GET | `/` | 网页（导入、预览、锁定、重开四步操作） |
+| GET | `/` | 网页（导入、更正、预览、锁定、重开五步操作） |
 
 ## 启动（Docker Compose）
 
@@ -57,12 +88,14 @@ docker compose up --build
 # 打开 http://localhost:8000
 ```
 
-SQLite 库文件持久化在宿主机 `./data/app.db`（compose 已挂载卷）。
+SQLite 库文件持久化在宿主机 `./data/app.db`（compose 已挂载卷）。旧版本库首次启动时
+自动迁移：`prices` 重建为带 `price_id` 的结构并固化启用基线事件，旧送审号回填
+`price_seq`，迁移前后价格数值不变。
 
 ## 本地无 Docker 时运行
 
 ```bash
-pip install -r requirements-dev.txt
+pip install -r requirements-dev.txt   # 本环境可装到 .pylibs（pytest.ini 已含该路径）
 export APP_DB_PATH=./data/app.db
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 pytest -q
@@ -72,29 +105,40 @@ pytest -q
 
 ```
 app/
-  db.py         # SQLite 连接与建表（5 张表）
-  models.py     # Pydantic 请求/响应模型
-  services.py   # 折算因子、四舍五入、依据指纹、序列重算（纯函数）
-  main.py       # FastAPI 路由
-  static/index.html  # 单页前端
-tests/          # 13 项 pytest 端到端自测
+  db.py         # SQLite 连接、建表与旧库迁移（9 张表/索引）
+  models.py     # Pydantic 请求/响应模型（含更正单、price_seq）
+  services.py   # 折算因子、四舍五入、依据指纹、序列重算；
+                # 更正规范化/校验/置换/事件重放（纯函数）
+  main.py       # FastAPI 路由（行情、更正、公告、预览、送审、重开）
+  static/index.html  # 单页前端（含交易日更正入口）
+tests/
+  test_adjustments.py  # 原 13 项端到端自测（全部保留通过）
+  test_corrections.py  # 更正功能 14 项端到端自测
+  http_demo.py         # 对运行中服务的 HTTP 全场景实测脚本（不被 pytest 收集）
 Dockerfile / docker-compose.yml / requirements*.txt
 ```
 
-## 自测覆盖
+## 自测覆盖（27 项 pytest，全部通过）
 
-`tests/test_adjustments.py`（13 项，全部通过）：
+原 13 项（折算方向、四舍五入、依据快照边界、公告收发、行情冲突、锁定/更正/重启重现、
+参数校验）保持通过；新增 `tests/test_corrections.py` 14 项：
 
-1. 拆股/并股在基准日前、后的因子方向与倒数对称性；
-2. 四舍五入到分（含 0.5 进位）；
-3. 依据快照边界筛选（早于区间起、晚于 max(区间止,基准日) 不留底）；
-4. API 端到端：基准日在生效日后/前的完整折算序列；
-5. 多次拆并股连乘；
-6. 公告同版原样重送沿用、异文退回、低修订退回、更高修订更正；
-7. 行情重复导入跳过、异价冲突整批退回且底表不变；
-8. 锁定后公告更正：旧指纹锁定 409、预览 stale、凭送审号重开逐点重现；
-9. 模拟进程重启后凭送审号重开；
-10. 参数校验（基准日不在底表、越出区间、送审号不存在、日期格式）。
+1. 对应表规范化与校验（重复原/目标日期、from==to、原日期缺行情、目标日占用未移走）；
+2. 事件重放纯函数（导入 + 互换，按 seq 还原归属，整单置换两阶段应用）；
+3. 更正只改日期归属、价格不变，`prices` 行数与 `price_id` 数不变（单一记录）；
+4. **两日互换**及再次互换还原；三日闭合链 A→B→B→C→C→A；
+5. 各类冲突 409/422 整单回滚、失败单号不留痕可复用；
+6. 成功单原样重传返回原结果（reused，序号不变）、同号异文 409；
+7. 更正预览只读不写；
+8. 更正后旧 `price_seq` 预览 stale、锁定 409，刷新后可锁定；
+9. 旧送审按送审时序列重现，现行预览按更正后交易日取价；
+10. **迁出后补录再重开旧送审**：补录价只进现行视图，旧送审逐点不变；
+11. 模拟进程重启后，更正前后两个送审号各自按其序列重开；
+12. 旧版库迁移：启用前送审号重开以启用时基线序列为准；
+13. 补录与更正交错：先提交成功者占用日期，后到冲突退回且不留痕。
+
+另用 `tests/http_demo.py` 对真实 uvicorn 进程跑过完整 HTTP 场景（含互换、迁出补录、
+重开、重启持久化、物理表单一记录核对），全部通过。
 
 ## 已知遗留/约束
 
@@ -102,5 +146,7 @@ Dockerfile / docker-compose.yml / requirements*.txt
 - 无鉴权/用户体系，送审号为不可猜随机号（UUID 前 16 位），仅适用于内网可信环境。
 - 公告生效日按自然日比较；若生效日非交易日，按题意仍自该日起生效（首个晚于它的
   交易日适用新口径），未额外校验公告日历。
-- 容器运行时在当前环境不可用，未实跑 `docker compose build`，仅做了 compose 配置静态
-  校验与等效的 uvicorn 实进程冒烟。
+- 事件流为只追加设计，更正单本身不可再更正/撤销（可通过新的更正单把日期改回，
+  历史序列仍可逐次重放）。
+- 当前环境没有 Docker 守护进程，未实跑 `docker compose build`；已做 compose 配置
+  静态校验，并以等效的 uvicorn 实进程 + HTTP 脚本完成全部功能实测。

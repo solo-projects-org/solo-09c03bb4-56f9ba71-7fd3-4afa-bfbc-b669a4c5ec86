@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>拆并股收盘价折算</title>
+<title>拆并股收盘价折算（含交易日更正）</title>
 <style>
   :root { --bd:#d0d7de; --bg:#f6f8fa; --ok:#1a7f37; --warn:#9a6700; --err:#cf222e; }
   * { box-sizing: border-box; }
@@ -42,16 +42,46 @@
 <main>
 
 <section>
-  <h2>1. 导入日收盘价底表（一次导入，只增不改）</h2>
-  <p class="hint">每行一条，支持 <code>YYYY-MM-DD,收盘价分</code> 或 JSON <code>{"trade_date":"...","close_cents":1000}</code>；同日期同价重复跳过，异价整批退回。</p>
+  <h2>1. 导入日收盘价底表（一次导入，只增不改；空出的日期可重新补录）</h2>
+  <p class="hint">每行一条，支持 <code>YYYY-MM-DD,收盘价分</code> 或 JSON <code>{"trade_date":"...","close_cents":1000}</code>；同日期同价重复跳过，异价整批退回。补录与更正交错时，以先提交成功的结果判断冲突。</p>
   <textarea id="priceInput" placeholder="2026-01-05,1000
 2026-01-06,1020"></textarea>
-  <div class="row" style="margin-top:8px"><button class="primary" onclick="importPrices()">导入收盘价</button></div>
+  <div class="row" style="margin-top:8px">
+    <button class="primary" onclick="importPrices()">导入/补录收盘价</button>
+    <button onclick="loadPrices()">刷新底表与序列</button>
+    <span id="priceSeqTag" class="hint"></span>
+  </div>
   <div id="priceMsg"></div>
+  <div style="max-height:260px; overflow:auto">
+    <table id="priceTable" style="display:none"><thead><tr>
+      <th>交易日</th><th>收盘价(分)</th>
+    </tr></thead><tbody></tbody></table>
+  </div>
 </section>
 
 <section>
-  <h2>2. 导入拆并股公告（编号 / 修订 / 生效日 / 旧股数 → 新股数）</h2>
+  <h2>2. 交易日更正（只改日期归属，收盘价照旧）</h2>
+  <p class="hint">填写更正单号并粘贴“原交易日 → 正确交易日”对应表，每行一条，支持
+    <code>原日期,正确日期</code> 或 JSON <code>{"from_date":"...","to_date":"..."}</code>。
+    原日期须有行情；每个原日期、每个目标日期各只能出现一次；目标日期已有行情时，那条行情也须在同一单中移走（允许两日互换）。整单生效，冲突或写入失败保留原归属。成功单原样重传返回原结果，同号异文报冲突。更正前的预览须刷新才能送审。</p>
+  <div class="row">
+    <div class="field"><label>更正单号</label><input id="corrNo" placeholder="C001" style="width:180px"></div>
+  </div>
+  <textarea id="corrInput" style="margin-top:8px" placeholder="2026-01-05,2026-01-07
+2026-01-07,2026-01-05"></textarea>
+  <div class="row" style="margin-top:8px">
+    <button onclick="correctionPreview()">校验预览（不写库）</button>
+    <button class="primary" onclick="correctionApply()">提交更正单（整单生效）</button>
+    <button onclick="loadCorrections()">刷新更正单</button>
+  </div>
+  <div id="corrMsg"></div>
+  <table id="corrTable" style="display:none"><thead><tr>
+    <th>更正单号</th><th>价格序列</th><th>对应表（原 → 正确）</th>
+  </tr></thead><tbody></tbody></table>
+</section>
+
+<section>
+  <h2>3. 导入拆并股公告（编号 / 修订 / 生效日 / 旧股数 → 新股数）</h2>
   <p class="hint">每号取最高修订；同号同版原样重送沿用原公告，异文退回；更高修订即更正。</p>
   <div class="row">
     <div class="field"><label>公告编号</label><input id="annNo" placeholder="A001"></div>
@@ -69,12 +99,12 @@
 </section>
 
 <section>
-  <h2>3. 选区间与基准交易日，预览折算序列</h2>
+  <h2>4. 选区间与基准交易日，预览折算序列（查询/复权按更正后的交易日取价）</h2>
   <div class="row">
     <div class="field"><label>区间起</label><input id="startDate" type="date"></div>
     <div class="field"><label>区间止</label><input id="endDate" type="date"></div>
     <div class="field"><label>基准交易日</label><input id="baseDate" type="date"></div>
-    <button class="primary" onclick="preview()">预览折算</button>
+    <button class="primary" onclick="preview()">预览折算（刷新）</button>
   </div>
   <div id="previewMeta"></div>
   <div style="max-height:340px; overflow:auto">
@@ -85,7 +115,8 @@
 </section>
 
 <section>
-  <h2>4. 锁定送审 / 凭送审号重开</h2>
+  <h2>5. 锁定送审 / 凭送审号重开</h2>
+  <p class="hint">启用功能前的送审号重开以启用时查到的序列为准；此后的送审号按送审时的序列重开，重启后也一样。</p>
   <div class="row">
     <button class="primary" onclick="lockIn()">锁定当前预览并取得送审号</button>
     <div class="field"><label>送审号</label><input id="subId" placeholder="SB-XXXX" style="width:240px"></div>
@@ -102,6 +133,7 @@
 </main>
 <script>
 let currentBasisHash = null;
+let currentPriceSeq = null;
 
 function show(el, kind, text) {
   el.className = "msg " + kind;
@@ -130,6 +162,19 @@ function parseLines(text) {
   }
   return out;
 }
+function parseMappings(text) {
+  const out = [];
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (line.startsWith("{")) out.push(JSON.parse(line));
+    else {
+      const [f, t] = line.split(",").map(s => s.trim());
+      out.push({ from_date: f, to_date: t });
+    }
+  }
+  return out;
+}
 async function importPrices() {
   const el = document.getElementById("priceMsg");
   try {
@@ -138,8 +183,62 @@ async function importPrices() {
       method: "POST", headers: {"Content-Type": "application/json"},
       body: JSON.stringify({ prices })
     });
-    show(el, "ok", `收到 ${r.received} 条；新写入 ${r.inserted} 条；相同重复跳过 ${r.skipped_identical} 条。`);
+    show(el, "ok", `收到 ${r.received} 条；新写入 ${r.inserted} 条；相同重复跳过 ${r.skipped_identical} 条。现行价格序列 seq=${r.price_seq}`);
+    loadPrices();
   } catch (e) { show(el, "err", e.message); }
+}
+async function loadPrices() {
+  const r = await api("/api/prices");
+  currentPriceSeq = r.price_seq;
+  document.getElementById("priceSeqTag").textContent = `现行价格序列 seq=${r.price_seq}，共 ${r.prices.length} 个交易日`;
+  const tbl = document.getElementById("priceTable");
+  const tb = tbl.querySelector("tbody");
+  tb.innerHTML = "";
+  for (const p of r.prices) {
+    tb.innerHTML += `<tr><td>${p.trade_date}</td><td>${p.close_cents}</td></tr>`;
+  }
+  tbl.style.display = r.prices.length ? "table" : "none";
+}
+async function correctionPreview() {
+  const el = document.getElementById("corrMsg");
+  try {
+    const body = {
+      corr_no: document.getElementById("corrNo").value.trim(),
+      items: parseMappings(document.getElementById("corrInput").value),
+    };
+    const r = await api("/api/corrections/preview", {
+      method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)
+    });
+    const moves = r.moves.map(m => `${m.from_date} → ${m.to_date}（${m.close_cents} 分）`).join("\n");
+    show(el, "ok", `${r.note}\n移动明细：\n${moves}\n\n注意：该预览须刷新后才能送审，提交更正成功后请重新预览折算。`);
+  } catch (e) { show(el, "err", e.message); }
+}
+async function correctionApply() {
+  const el = document.getElementById("corrMsg");
+  try {
+    const body = {
+      corr_no: document.getElementById("corrNo").value.trim(),
+      items: parseMappings(document.getElementById("corrInput").value),
+    };
+    const r = await api("/api/corrections/apply", {
+      method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)
+    });
+    const moves = r.items.map(m => `${m.from_date} → ${m.to_date}`).join("\n");
+    show(el, "ok", `【${r.outcome}】${r.note}\n价格序列 seq=${r.price_seq}\n${moves}`);
+    loadCorrections();
+    loadPrices();
+  } catch (e) { show(el, "err", e.message); }
+}
+async function loadCorrections() {
+  const { corrections } = await api("/api/corrections");
+  const tbl = document.getElementById("corrTable");
+  const tb = tbl.querySelector("tbody");
+  tb.innerHTML = "";
+  for (const c of corrections) {
+    const map = c.items.map(i => `${i.from_date}→${i.to_date}`).join("；");
+    tb.innerHTML += `<tr><td>${c.corr_no}</td><td>seq=${c.price_seq}</td><td>${map}</td></tr>`;
+  }
+  tbl.style.display = corrections.length ? "table" : "none";
 }
 async function importAnn() {
   const el = document.getElementById("annMsg");
@@ -187,12 +286,14 @@ async function preview() {
     base_date: document.getElementById("baseDate").value,
   });
   if (currentBasisHash) params.set("basis_hash", currentBasisHash);
+  if (currentPriceSeq !== null) params.set("price_seq", currentPriceSeq);
   try {
     const r = await api("/api/adjustments/preview?" + params);
     currentBasisHash = r.basis_hash;
+    currentPriceSeq = r.price_seq;
     const basis = r.basis.map(b => `${b.ann_no}(r${b.revision}, ${b.effective_date}, ${b.old_shares}→${b.new_shares})`).join("；") || "无";
     el.className = "msg " + (r.stale ? "warn" : "ok");
-    el.innerHTML = `依据指纹 <code>${r.basis_hash.slice(0, 16)}…</code>　`
+    el.innerHTML = `依据指纹 <code>${r.basis_hash.slice(0, 16)}…</code>　价格序列 <code>seq=${r.price_seq}</code>　`
       + (r.stale ? `<span class="pill warn">须刷新</span> ${r.note}` : `<span class="pill ok">现行</span>`)
       + `<br>参与折算公告：${basis}`;
     renderTable(document.getElementById("previewTable"), r.points);
@@ -208,10 +309,11 @@ async function lockIn() {
         end_date: document.getElementById("endDate").value,
         base_date: document.getElementById("baseDate").value,
         basis_hash: currentBasisHash,
+        price_seq: currentPriceSeq,
       })
     });
     document.getElementById("subId").value = r.submission_id;
-    show(el, "ok", `已锁定，送审号：${r.submission_id}\n依据指纹：${r.basis_hash}`);
+    show(el, "ok", `已锁定，送审号：${r.submission_id}\n依据指纹：${r.basis_hash}\n锁定时价格序列：seq=${r.price_seq}`);
     renderTable(document.getElementById("subTable"), r.points);
   } catch (e) { show(el, "err", e.message); }
 }
@@ -221,11 +323,14 @@ async function reopen() {
   try {
     const r = await api("/api/submissions/" + encodeURIComponent(id));
     el.className = "msg " + (r.stale ? "warn" : "ok");
-    el.textContent = `${r.note}\n送审依据指纹：${r.basis_hash.slice(0,16)}… / 现行：${r.current_basis_hash.slice(0,16)}…`;
+    el.textContent = `${r.note}\n送审依据指纹：${r.basis_hash.slice(0,16)}… / 现行：${r.current_basis_hash.slice(0,16)}…`
+      + `\n送审价格序列：seq=${r.price_seq} / 现行：seq=${r.current_price_seq}`;
     renderTable(document.getElementById("subTable"), r.points);
   } catch (e) { show(el, "err", e.message); }
 }
 loadAnns();
+loadCorrections();
+loadPrices();
 </script>
 </body>
 </html>

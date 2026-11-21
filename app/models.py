@@ -28,6 +28,28 @@ class PriceImportResult(BaseModel):
     inserted: int
     skipped_identical: int
     conflicts: list[dict]
+    price_seq: int = Field(description="本批写入后的现行价格序列序号（无写入则不变）")
+
+
+class CorrectionItemIn(BaseModel):
+    from_date: str = Field(description="原交易日 YYYY-MM-DD（须有行情）")
+    to_date: str = Field(description="正确交易日 YYYY-MM-DD")
+
+    _v1 = field_validator("from_date")(_validate_date)
+    _v2 = field_validator("to_date")(_validate_date)
+
+
+class CorrectionIn(BaseModel):
+    corr_no: str = Field(min_length=1, description="更正单号")
+    items: list[CorrectionItemIn] = Field(min_length=1, description="原日期->正确日期对应表")
+
+
+class CorrectionResult(BaseModel):
+    corr_no: str
+    outcome: str = Field(description="applied 首次生效 / reused 原样重传沿用 / conflict 同号异文")
+    price_seq: int
+    items: list[CorrectionItemIn]
+    note: str = ""
 
 
 class AnnouncementIn(BaseModel):
@@ -64,6 +86,7 @@ class PreviewResult(BaseModel):
     basis_hash: str
     basis: list[dict]
     points: list[AdjustedPoint]
+    price_seq: int = Field(description="现行价格序列序号；送审时须原样带回")
     stale: bool
     note: str = ""
 
@@ -73,6 +96,10 @@ class LockInRequest(BaseModel):
     end_date: str
     base_date: str
     basis_hash: str = Field(description="预览返回的依据指纹，须与现行公告一致")
+    price_seq: int | None = Field(
+        default=None,
+        description="预览返回的价格序列序号；与现行序列不一致须刷新后再锁定",
+    )
 
     _v1 = field_validator("start_date")(_validate_date)
     _v2 = field_validator("end_date")(_validate_date)
@@ -82,6 +109,7 @@ class LockInRequest(BaseModel):
 class LockInResult(BaseModel):
     submission_id: str
     basis_hash: str
+    price_seq: int
     points: list[AdjustedPoint]
 
 
@@ -92,6 +120,8 @@ class ReopenResult(BaseModel):
     base_date: str
     basis_hash: str
     current_basis_hash: str
+    price_seq: int = Field(description="本送审号锁定时的价格序列序号")
+    current_price_seq: int = Field(description="当前最新价格序列序号")
     stale: bool
     note: str
     points: list[AdjustedPoint]
